@@ -71,16 +71,17 @@ class ICPConfig(BaseModel):
 class EmailChannelConfig(BaseModel):
     enabled: bool = True
     # "instantly" (legacy), "gmail" (Gmail/Workspace via API — recommended),
-    # or "smtp" (any SMTP+IMAP mailbox: AgentMail, Fastmail, ...)
+    # "microsoft" (Microsoft 365 / Outlook via Graph), or "smtp" (any
+    # SMTP+IMAP mailbox: AgentMail, Fastmail, ...)
     provider: str = "instantly"
     max_daily_sends: int = 50
     # When True, also send to catch-all ("risky") domains, not just verified
     # mailboxes. Off by default — catch-alls accept everything, so a bad
     # guess still bounces.
     send_to_risky: bool = False
-    # Copilot mode (native providers): every outgoing email waits in the
-    # outbox for your approval (dashboard → Outbox, or `harvey outbox`).
-    # Set false for full autopilot once you trust the output.
+    # Native providers queue mail for approval. Instantly cannot use that
+    # outbox, so it holds campaigns and escalates replies while this is true.
+    # Set false explicitly for full autopilot once you trust the output.
     require_approval: bool = True
     # Kill switch: pause all sending when bounces exceed this fraction of
     # sent mail (measured over the trailing sends). 0 disables the switch.
@@ -94,8 +95,31 @@ class EmailChannelConfig(BaseModel):
         return v
 
 
+def legacy_sending_held(config) -> bool:
+    """True when Instantly is the provider and approval is required.
+
+    Instantly has no per-email approval queue, so with require_approval on
+    Harvey holds campaign deployment and hands replies to a human.
+    """
+    email = getattr(getattr(config, "channels", None), "email", None)
+    return (getattr(email, "provider", "") == "instantly"
+            and bool(getattr(email, "require_approval", True)))
+
+
+def sending_notice(config) -> str:
+    """A plain-language warning when outbound sending is held by config, or ""."""
+    if not legacy_sending_held(config):
+        return ""
+    return (
+        "Instantly sending is held: channels.email.require_approval is true, and "
+        "Instantly has no approval queue. Campaigns stay as drafts and replies go to "
+        "a human (dashboard Activity tab). Set require_approval: false to let Instantly "
+        "send automatically, or switch to gmail, microsoft or smtp to approve each email."
+    )
+
+
 class LinkedInChannelConfig(BaseModel):
-    enabled: bool = True
+    enabled: bool = False
     max_daily_connections: int = 20
     max_daily_messages: int = 10
 
@@ -103,6 +127,88 @@ class LinkedInChannelConfig(BaseModel):
 class ChannelsConfig(BaseModel):
     email: EmailChannelConfig = EmailChannelConfig()
     linkedin: LinkedInChannelConfig = LinkedInChannelConfig()
+
+
+PRECLEARED_ADDRESS_SOURCES = ("published", "bought", "scraped", "given", "unknown")
+
+
+def normalize_prospect_country(v) -> str:
+    """A two-letter country code ("us" -> "US", "UK" -> "GB"), or "" for none.
+
+    Raises ValueError on anything else, including the booleans YAML makes of
+    an unquoted NO (Norway) or ON, so a typo is never silently ignored.
+    """
+    if isinstance(v, bool):
+        raise ValueError(
+            f"prospect_country was read as {v}. YAML turns an unquoted NO or "
+            'ON into true/false, so quote the code, e.g. prospect_country: "NO".'
+        )
+    v = str(v or "").strip().upper()
+    v = {"UK": "GB", "USA": "US"}.get(v, v)
+    if v and not (len(v) == 2 and v.isascii() and v.isalpha()):
+        raise ValueError(
+            f"'{v}' is not a valid prospect_country. Use a two-letter "
+            "country code such as US or GB, or leave it empty."
+        )
+    return v
+
+
+class PreclearedConfig(BaseModel):
+    """Optional per-recipient cold-email check through Precleared.
+
+    Off by default. When on, each new recipient is checked once, before the
+    first cold email, against UK PECR, US CAN-SPAM, Canada's CASL, Germany's
+    UWG and France's rules. Any verdict other than ok_to_email holds the
+    email back with the reason. See harvey/integrations/precleared.py.
+    """
+
+    enabled: bool = False
+    # Where your business is based: GB or US. Required when enabled.
+    sender_country: str = ""
+    # Where prospect addresses come from, in Precleared's terms. Harvey
+    # builds most addresses from a learned pattern, so the honest default
+    # is "unknown"; use "published" only if yours are copied from the
+    # businesses' own websites.
+    address_source: str = "unknown"
+    # Optional: the country your prospects are in (two letters, e.g. "US"),
+    # if they are all in one. Precleared uses it only when it can't work out
+    # the recipient's country from the address, company records or the
+    # company's website. Leave empty if your prospects are spread out.
+    prospect_country: str = ""
+
+    @field_validator("sender_country", mode="before")
+    @classmethod
+    def _upper_country(cls, v) -> str:
+        return str(v or "").strip().upper()
+
+    @field_validator("address_source", mode="before")
+    @classmethod
+    def _valid_source(cls, v) -> str:
+        v = str(v or "unknown").strip().lower()
+        if v not in PRECLEARED_ADDRESS_SOURCES:
+            raise ValueError(
+                f"'{v}' is not a valid address_source. "
+                f"Use one of: {', '.join(PRECLEARED_ADDRESS_SOURCES)}."
+            )
+        return v
+
+    @field_validator("prospect_country", mode="before")
+    @classmethod
+    def _valid_prospect_country(cls, v) -> str:
+        return normalize_prospect_country(v)
+
+    @model_validator(mode="after")
+    def _country_when_enabled(self):
+        if self.enabled and self.sender_country not in ("GB", "US"):
+            raise ValueError(
+                "compliance.precleared.sender_country must be GB or US "
+                "when the check is enabled."
+            )
+        return self
+
+
+class ComplianceConfig(BaseModel):
+    precleared: PreclearedConfig = PreclearedConfig()
 
 
 class QuietHoursConfig(BaseModel):
@@ -220,6 +326,14 @@ class BrainConfig(BaseModel):
         return self
 
 
+class WriterConfig(BaseModel):
+    # Run every draft through one extra editing-only brain call using the
+    # Humanizer skill's instructions (~/.claude/skills/humanizer/SKILL.md,
+    # or HARVEY_HUMANIZER_SKILL). Off by default: installing the skill for
+    # your own Claude Code use never changes what Harvey sends on its own.
+    humanizer: bool = False
+
+
 class HarveyConfig(BaseModel):
     persona: PersonaConfig
     product: ProductConfig
@@ -227,6 +341,8 @@ class HarveyConfig(BaseModel):
     channels: ChannelsConfig = ChannelsConfig()
     usage: UsageConfig = UsageConfig()
     brain: BrainConfig = BrainConfig()
+    compliance: ComplianceConfig = ComplianceConfig()
+    writer: WriterConfig = WriterConfig()
 
 
 class EnvConfig(BaseModel):
@@ -252,6 +368,11 @@ class EnvConfig(BaseModel):
     imap_port: int = 993
     imap_username: str = ""
     imap_password: str = ""
+    # Microsoft 365 (channels.email.provider: microsoft)
+    m365_client_id: str = ""
+    m365_tenant_id: str = ""
+    # Optional: only used when compliance.precleared.enabled is true.
+    precleared_api_key: str = ""
 
 
 def _format_validation_error(e: ValidationError) -> str:
@@ -362,6 +483,9 @@ def load_env() -> EnvConfig:
         imap_port=int(os.getenv("IMAP_PORT", "993").strip() or 993),
         imap_username=os.getenv("IMAP_USERNAME", "").strip(),
         imap_password=os.getenv("IMAP_PASSWORD", "").strip(),
+        m365_client_id=os.getenv("M365_CLIENT_ID", "").strip(),
+        m365_tenant_id=os.getenv("M365_TENANT_ID", "").strip(),
+        precleared_api_key=os.getenv("PRECLEARED_API_KEY", "").strip(),
     )
     return env
 

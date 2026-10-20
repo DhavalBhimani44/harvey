@@ -12,7 +12,7 @@ upgrade cleanly in place.
 import json
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, date, timezone
+from datetime import datetime, date, timedelta, timezone
 from pathlib import Path
 
 import aiosqlite
@@ -28,6 +28,10 @@ DB_PATH = PROJECT_ROOT / "data" / "harvey.db"
 
 # How long (seconds) a connection waits on a locked database before failing.
 BUSY_TIMEOUT_SECONDS = 30.0
+
+# Email statuses the Writer drafts for. Shared with the heartbeat so it only
+# chooses write_campaign when there is something the Writer will act on.
+WRITABLE_EMAIL_STATUSES = ("verified", "risky")
 
 
 def _new_id() -> str:
@@ -861,6 +865,7 @@ class StateManager:
         status: str | None = None,
         due_before: str | None = None,
         limit: int = 200,
+        exclude_kind: str | None = None,
     ) -> list[dict]:
         where, params = [], []
         if status:
@@ -869,6 +874,9 @@ class StateManager:
         if due_before:
             where.append("(send_at IS NULL OR send_at <= ?)")
             params.append(due_before)
+        if exclude_kind:
+            where.append("(kind IS NULL OR kind != ?)")
+            params.append(exclude_kind)
         sql = "SELECT * FROM outbox"
         if where:
             sql += " WHERE " + " AND ".join(where)
@@ -1203,6 +1211,39 @@ class StateManager:
             async with db.execute(sql, params) as cursor:
                 return [row[0] for row in await cursor.fetchall()]
 
+    async def cohort_companies(self, require: list[str], exclude: list[str],
+                               offset: int = 0, limit: int | None = None) -> tuple[int, list[dict]]:
+        """Count all matches and page company details in one read snapshot."""
+        if not require:
+            return 0, []
+        require = list(dict.fromkeys(require))
+        exclude = list(dict.fromkeys(exclude))
+        matches = (
+            "SELECT company_id FROM positive WHERE company_id != '' AND "
+            f"signal_code IN ({','.join('?' for _ in require)}) "
+            "AND confidence >= 0 GROUP BY company_id "
+            "HAVING COUNT(DISTINCT signal_code) = ?"
+        )
+        params = [*require, len(require)]
+        if exclude:
+            matches += (" AND company_id NOT IN (SELECT company_id FROM positive "
+                        f"WHERE signal_code IN ({','.join('?' for _ in exclude)}))")
+            params.extend(exclude)
+        base = self._CURRENT_CTE + " SELECT {columns} FROM companies WHERE id IN (" + matches + ")"
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN")
+            async with db.execute(base.format(columns="COUNT(*)"), params) as cursor:
+                size = (await cursor.fetchone())[0]
+            sql = base.format(columns="id, name, domain, website, industry, location")
+            sql += " ORDER BY LOWER(COALESCE(name, '')), id"
+            page_params = list(params)
+            if limit is not None:
+                sql += " LIMIT ? OFFSET ?"
+                page_params.extend([limit, offset])
+            async with db.execute(sql, page_params) as cursor:
+                return size, [dict(row) for row in await cursor.fetchall()]
+
     async def companies_needing_profile(
         self, limit: int = 100, stale_days: int = 90
     ) -> list[dict]:
@@ -1255,6 +1296,20 @@ class StateManager:
                 """UPDATE companies SET profile_checked_at = CURRENT_TIMESTAMP,
                        updated_at = CURRENT_TIMESTAMP WHERE id = ?""",
                 (company_id,),
+            )
+            await db.commit()
+
+    async def rename_company(self, company_id: str, name: str):
+        """Set a company's name, and the copy each of its prospects carries."""
+        async with self._connect() as db:
+            await db.execute(
+                "UPDATE companies SET name = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (name, company_id),
+            )
+            await db.execute(
+                "UPDATE prospects SET company = ?, updated_at = CURRENT_TIMESTAMP "
+                "WHERE company_id = ?",
+                (name, company_id),
             )
             await db.commit()
 
@@ -1412,6 +1467,33 @@ class StateManager:
                     if await cursor.fetchone():
                         return True
         return False
+
+    async def count_writable_prospects(self) -> int:
+        """New prospects the Writer can draft for (a deliverable email)."""
+        marks = ",".join("?" for _ in WRITABLE_EMAIL_STATUSES)
+        async with self._connect() as db:
+            async with db.execute(
+                f"""SELECT COUNT(*) FROM prospects
+                    WHERE status = 'new' AND email != ''
+                      AND email_status IN ({marks})""",
+                WRITABLE_EMAIL_STATUSES,
+            ) as cursor:
+                return (await cursor.fetchone())[0]
+
+    async def count_recent_unusable_prospects(self, hours: int = 24) -> int:
+        """New prospects found in the last ``hours`` that the Writer can't use."""
+        since = (_utcnow() - timedelta(hours=hours)).isoformat()
+        marks = ",".join("?" for _ in WRITABLE_EMAIL_STATUSES)
+        async with self._connect() as db:
+            async with db.execute(
+                f"""SELECT COUNT(*) FROM prospects
+                    WHERE status = 'new'
+                      AND NOT (COALESCE(email, '') != ''
+                               AND COALESCE(email_status, '') IN ({marks}))
+                      AND datetime(created_at) >= datetime(?)""",
+                (*WRITABLE_EMAIL_STATUSES, since),
+            ) as cursor:
+                return (await cursor.fetchone())[0]
 
     async def count_prospects_by_status(self) -> dict[str, int]:
         async with self._connect() as db:
@@ -1838,6 +1920,13 @@ class StateManager:
 
         return {
             "prospects": prospect_counts,
+            # The 'new' prospects the Writer can act on. A guessed or invalid
+            # address stays 'new' forever, so deciding from the raw count
+            # would keep choosing write_campaign with nothing to write.
+            "writable_prospects": await self.count_writable_prospects(),
+            # Unusable ones found in the last day: the heartbeat pauses
+            # prospecting for the day when these alone fill the backlog.
+            "recent_unusable_prospects": await self.count_recent_unusable_prospects(),
             "draft_campaigns": draft_campaigns,
             "active_campaigns": active_campaigns,
             "open_conversations": open_conversations,
@@ -1852,3 +1941,4 @@ class StateManager:
             # Claude budget the rest of the loop is rationing.
             "unprofiled": await self.count_companies_needing_profile(),
         }
+

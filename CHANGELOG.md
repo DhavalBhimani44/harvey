@@ -5,6 +5,63 @@ Notable changes to Harvey. Dates are release dates; the format follows
 follow [semver](https://semver.org/), with the caveat that Harvey is pre-1.0 and
 minor versions can still change behaviour.
 
+## [Unreleased]
+
+### Fixed
+
+- Keep local website requests out of private networks, including redirects and
+  DNS rebinding. Preserve the original hostname for TLS verification. Website
+  fetching (search, company sites, profiling, the training crawler) now ignores
+  `HTTP_PROXY`/`HTTPS_PROXY`, so it can't be routed around that boundary; mail
+  and API integrations are unchanged. `harvey train` refuses local or intranet
+  URLs and says so.
+- **Instantly users: check `require_approval`.** Instantly has no per-email
+  approval queue, so with `channels.email.require_approval: true` (the default)
+  Harvey now holds campaign deployment and hands replies to a human instead of
+  silently bypassing the setting. `harvey run` and `harvey status` say when this
+  is happening; prospecting and drafting carry on (drafts wait, using model
+  quota, until sending is allowed). Set `require_approval: false` for
+  Instantly autopilot.
+- Disable LinkedIn by default in the model, sample config, and product trainer;
+  save the setup wizard's explicit LinkedIn choice when updating a config.
+  Answering "no" to LinkedIn when re-running `harvey setup` now turns it off
+  (saved credentials stay in `.env`).
+- Protect the local dashboard with an access token, restrict requests to trusted
+  local origins, and save settings with owner-only permissions. Update and restart
+  Harvey, then open the dashboard link printed in your terminal.
+- Isolate Claude calls from personal instructions and hooks, and fix Claude CLI
+  installation in Docker. Thanks to @EICCIO-Advisors for the private report.
+
+### Added
+
+- **Microsoft 365 mail provider.** Set `channels.email.provider: microsoft` to
+  send and read through a Microsoft 365 / Outlook mailbox via Microsoft Graph,
+  for domains whose mail lives in Exchange Online (which no longer accepts
+  passwords over IMAP). Signs in once with OAuth + PKCE (`harvey microsoft
+  auth`; no client secret, no stored password), drafts then sends so the
+  Message-ID is known, threads replies with `createReply`, reads the last 7
+  days of the inbox without marking anything read, refuses to act as any
+  mailbox other than `persona.email`, and holds sending when the inbox can't
+  be read. See [docs/microsoft365.md](docs/microsoft365.md).
+- **Optional per-recipient compliance check (Precleared).** Set
+  `compliance.precleared.enabled: true` with `sender_country: GB` or `US` to
+  have each new recipient checked before the first cold email against UK
+  PECR, US CAN-SPAM, Canada's CASL, Germany's UWG and France's rules. Any
+  verdict but `ok_to_email` fails that outbox item with the rule and the next
+  step. If the check can't be made (daily allowance used up, network down, a
+  malformed response), cold emails wait for a later cycle while replies still
+  go out. One check per address, cached for 30 days; changing the sender
+  country, address source or product description triggers a fresh check. The
+  receipt id is logged with each send. Native providers only. Off by default.
+- **Cohort builder pagination and CSV export.** The cohort table on the
+  Signals tab used to stop at the first 50 matches with no way to see the
+  rest. It now pages with Prev / Next ("Showing 51–100 of 147"), and an
+  Export CSV button downloads the whole cohort. `POST /api/cohort` accepts
+  `offset` and `limit` (default 50, max 200) and orders by name so pages never
+  overlap; `GET /api/cohort.csv?require=...&exclude=...` returns every match.
+  Counts and exports include every match; pages use a stable name/id SQL order.
+  CSV downloads carry dashboard authorization and escape spreadsheet formulas.
+
 ## [0.3.0] — 2026-10-13
 
 ### Added

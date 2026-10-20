@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import subprocess
 import sys
+import textwrap
 from pathlib import Path
 
 
@@ -172,13 +173,22 @@ def cmd_train(args):
 
 def cmd_dashboard(args):
     """Launch the local web dashboard."""
-    from harvey.dashboard import start_dashboard
+    from harvey.dashboard import DashboardSetupError, dashboard_url, start_dashboard
+    from harvey.dashboard_auth import TokenError
 
     if not 1 <= args.port <= 65535:
         print(f"  Invalid port: {args.port}. Must be 1-65535.")
         sys.exit(2)
 
-    start_dashboard(host=args.host, port=args.port)
+    try:
+        if getattr(args, "url", False):
+            # The unlock link for an already-running dashboard.
+            print(dashboard_url(host=args.host, port=args.port))
+            return
+        start_dashboard(host=args.host, port=args.port)
+    except (DashboardSetupError, TokenError) as e:
+        print(f"\n  Dashboard not started: {e}\n")
+        sys.exit(2)
 
 
 def cmd_status(args):
@@ -193,12 +203,31 @@ def cmd_status(args):
         print("\n  Harvey Pipeline Status")
         print("  " + "=" * 40)
         print(f"  Prospects:            {summary['prospects']}")
+        print(f"  Ready to write for:   {summary.get('writable_prospects', 0)} "
+              "(new, with a verified or catch-all email)")
         print(f"  Draft campaigns:      {summary['draft_campaigns']}")
         print(f"  Active campaigns:     {summary['active_campaigns']}")
         print(f"  Open conversations:   {summary['open_conversations']}")
         by_provider = summary.get("usage_today_by_provider", {})
         print(f"  Claude calls today:   {by_provider.get('claude', summary['usage_today'])}")
         print(f"  Codex calls today:    {by_provider.get('codex', 0)}")
+        from harvey.config import load_config, sending_notice
+        try:
+            notice = sending_notice(load_config())
+        except Exception:
+            # Status must still print when harvey.yaml is broken; that's
+            # when people run it. The --check path reports config errors.
+            notice = ""
+        from harvey.main import unusable_backlog_notice
+        backlog = unusable_backlog_notice(summary)
+        if backlog:
+            print("  Prospecting:          PAUSED")
+            print(textwrap.fill(backlog, width=72, initial_indent="                        ",
+                                subsequent_indent="                        "))
+        if notice:
+            print("  Sending:              HELD")
+            print(textwrap.fill(notice, width=72, initial_indent="                        ",
+                                subsequent_indent="                        "))
         from harvey.brain import BRAIN_STATUS_KEY, Brain, active_brain_status
         from harvey.config import ConfigError, load_brain_config
         try:
@@ -227,8 +256,8 @@ def cmd_status(args):
                     print(f"  Brain:                {label} ready (CLI, isolation, login, "
                           "model and account checked; no prompt sent)")
                 else:
-                    print(f"  Brain:                {label} (not checked: Claude is checked "
-                          "by its first call)")
+                    print(f"  Brain:                {label} CLI isolation flags present "
+                          "(login not checked: Claude is checked by its first call)")
         elif brain_status.get("status") == "paused":
             label = {"claude": "Claude", "codex": "Codex"}.get(brain_status.get("provider"), "Brain")
             print(f"  Brain:                {label} PAUSED since {brain_status.get('since', '?')}")
@@ -386,6 +415,28 @@ def cmd_gmail(args):
 
         async def _test():
             provider = GmailProvider(load_config(), env)
+            ok, detail = await provider.test_connection()
+            print(f"\n  {'✓' if ok else '✗'} {detail}\n")
+            sys.exit(0 if ok else 1)
+        asyncio.run(_test())
+
+
+def cmd_microsoft(args):
+    """Microsoft 365 provider utilities (auth / test)."""
+    from harvey.config import load_env
+
+    env = load_env()
+    if args.microsoft_action == "auth":
+        from harvey.integrations.microsoft import run_auth_flow
+        ok = run_auth_flow(env.m365_client_id, env.m365_tenant_id)
+        sys.exit(0 if ok else 1)
+
+    if args.microsoft_action == "test":
+        from harvey.config import load_config
+        from harvey.integrations.microsoft import MicrosoftProvider
+
+        async def _test():
+            provider = MicrosoftProvider(load_config(), env)
             ok, detail = await provider.test_connection()
             print(f"\n  {'✓' if ok else '✗'} {detail}\n")
             sys.exit(0 if ok else 1)
@@ -678,8 +729,12 @@ def main():
 
     # harvey dashboard
     sub = subparsers.add_parser("dashboard", help="Open the web dashboard")
-    sub.add_argument("--host", default="127.0.0.1", help="Host (default: 127.0.0.1)")
+    sub.add_argument("--host", default="127.0.0.1",
+                     help="Loopback address to listen on (default: 127.0.0.1; "
+                          "other addresses are refused)")
     sub.add_argument("--port", type=int, default=5555, help="Port (default: 5555)")
+    sub.add_argument("--url", action="store_true",
+                     help="Print the unlock link (with its token) and exit")
     sub.set_defaults(func=cmd_dashboard)
 
     # harvey status
@@ -687,7 +742,7 @@ def main():
     sub.add_argument(
         "--check", action="store_true",
         help="Also check the configured brain now (Codex: CLI version, isolation "
-             "and login; no model call)",
+             "and login; Claude: CLI isolation flags; no model call)",
     )
     sub.set_defaults(func=cmd_status)
 
@@ -710,6 +765,12 @@ def main():
     sub.add_argument("gmail_action", choices=["auth", "test"],
                      help="auth: one-time OAuth; test: verify connection")
     sub.set_defaults(func=cmd_gmail)
+
+    # harvey microsoft auth|test
+    sub = subparsers.add_parser("microsoft", help="Microsoft 365 provider setup")
+    sub.add_argument("microsoft_action", choices=["auth", "test"],
+                     help="auth: one-time sign-in; test: verify connection")
+    sub.set_defaults(func=cmd_microsoft)
 
     # harvey outbox
     sub = subparsers.add_parser("outbox", help="Review/approve queued emails")

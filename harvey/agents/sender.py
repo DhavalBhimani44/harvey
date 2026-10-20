@@ -21,6 +21,7 @@ from harvey.config import HarveyConfig, EnvConfig
 from harvey.gate import pre_send_check
 from harvey.integrations.instantly import InstantlyClient
 from harvey.integrations.mail_provider import NATIVE_PROVIDERS, get_mail_provider
+from harvey.integrations.precleared import PreclearedClient
 from harvey.state import StateManager
 
 logger = logging.getLogger("harvey.sender")
@@ -62,6 +63,8 @@ class Sender:
         self.config = config
         self.instantly = InstantlyClient(env.instantly_api_key)
         self.provider = get_mail_provider(config, env)
+        # Optional per-recipient compliance check; None unless enabled.
+        self.precleared = PreclearedClient.from_config(config, env)
         # Disabled in tests to skip inter-send sleeps.
         self.send_pacing = True
 
@@ -123,6 +126,16 @@ class Sender:
 
     async def _deploy_campaign(self, campaign):
         """Deploy a single campaign to Instantly. Idempotent: safe to retry."""
+        # Instantly owns campaign scheduling and has no per-message outbox
+        # approval here. Fail closed rather than silently bypass the setting,
+        # including retries of an already-created remote campaign.
+        if getattr(self.config.channels.email, "require_approval", True):
+            logger.warning(
+                "Sender: Instantly campaign held because require_approval is true. "
+                "Use a native mail provider for outbox review, or explicitly set "
+                "channels.email.require_approval: false for Instantly autopilot."
+            )
+            return
         logger.info(f"Sender: Deploying campaign '{campaign.name}'...")
 
         # 0. Validate before touching the network
@@ -334,7 +347,8 @@ class Sender:
     def _render(self, text: str, prospect) -> str:
         """Fill merge variables. The pre-send gate rejects any leftovers."""
         replacements = {
-            "first_name": prospect.first_name,
+            # A company inbox has no name; "there" keeps "Hi {{first_name}}," readable.
+            "first_name": prospect.first_name or ("there" if prospect.is_company_inbox else ""),
             "last_name": prospect.last_name,
             "company": prospect.company,
             "title": prospect.title,
@@ -437,14 +451,36 @@ class Sender:
         due = await self.state.get_outbox(
             status="approved", due_before=now, limit=budget * 3
         )
+        if self.precleared is not None:
+            # Cold emails held by an unavailable compliance check stay
+            # approved at the front of the queue and could fill the page
+            # above, so fetch replies (and any other unchecked kind) on their
+            # own too. Bounded: one extra query of the same size.
+            seen = {item["id"] for item in due}
+            unchecked = await self.state.get_outbox(
+                status="approved", due_before=now, limit=budget * 3,
+                exclude_kind="sequence",
+            )
+            extra = [item for item in unchecked if item["id"] not in seen]
+            if extra:
+                due = sorted(
+                    due + extra,
+                    key=lambda i: (i.get("send_at") or "", i.get("created_at") or ""),
+                )
         if not due:
             return
 
         allow_risky = getattr(self.config.channels.email, "send_to_risky", False)
         sent = 0
+        # Set when Precleared can't be asked (allowance used up, network):
+        # cold emails wait for a later cycle, replies still go out.
+        compliance_paused = False
         for item in due:
             if sent >= budget:
                 break
+            needs_check = self.precleared is not None and item["kind"] == "sequence"
+            if needs_check and compliance_paused:
+                continue
 
             prospect = await self.state.get_prospect(item["prospect_id"])
             if prospect is None:
@@ -475,6 +511,30 @@ class Sender:
                     f"{gate.reasons}"
                 )
                 continue
+
+            # Optional compliance check (compliance.precleared): one per
+            # address, before the first cold email. Replies are never checked.
+            receipt_id = ""
+            if needs_check:
+                clearance = await self.precleared.clear(item["to_email"], self.state)
+                if clearance.held:
+                    compliance_paused = True
+                    logger.warning(
+                        f"Sender: compliance check unavailable, holding cold "
+                        f"email until a later cycle: {clearance.reason}"
+                    )
+                    continue
+                if not clearance.allowed:
+                    await self.state.update_outbox_item(
+                        item["id"], status="failed",
+                        error=f"precleared: {clearance.verdict}: {clearance.reason}"[:300],
+                    )
+                    logger.warning(
+                        f"Sender: Precleared held back email to {item['to_email']}: "
+                        f"{clearance.verdict} ({clearance.reason})"
+                    )
+                    continue
+                receipt_id = clearance.receipt_id
 
             result = await self.provider.send_email(
                 item["to_email"], item["subject"], item["body"],
@@ -510,13 +570,16 @@ class Sender:
                         )
                 except Exception as e:
                     logger.debug(f"Sender: convo append failed: {e}")
+            details = {
+                "to": item["to_email"], "step": item["step"],
+                "kind": item["kind"], "provider": self.provider.name,
+            }
+            if receipt_id:
+                details["precleared_receipt"] = receipt_id
             await self.state.log_action(
                 action_type="email_sent",
                 agent="sender",
-                details={
-                    "to": item["to_email"], "step": item["step"],
-                    "kind": item["kind"], "provider": self.provider.name,
-                },
+                details=details,
             )
             logger.info(
                 f"Sender: sent step {item['step']} to {item['to_email']} "
